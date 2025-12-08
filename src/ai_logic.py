@@ -3,10 +3,12 @@ import numpy as np
 import copy
 import os
 from src.game_model import MoonPhaseGame
+from src.adj_map import DEFAULT_BOARD
 
 # 嘗試導入 TensorFlow，如果沒有安裝則優雅降級
 try:
-    from keras._tf_keras.keras import layers, models, optimizers
+    from keras._tf_keras.keras import layers, models, optimizers, Input, Model
+    import tensorflow as tf
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
@@ -115,16 +117,33 @@ class GreedyAI(AIPlayer):
 class AlphaZeroNetwork:
     """
     負責神經網路的建構、載入與預測
+    使用 Graph Neural Network (GNN) 架構
     """
-    def __init__(self, input_dim, num_actions, model_path=None):
-        self.input_dim = input_dim
+    def __init__(self, num_nodes, num_actions, model_path=None):
+        self.num_nodes = num_nodes
         self.num_actions = num_actions
         self.model = self.load_or_create_model(model_path)
 
     def load_or_create_model(self, path):
         if path and os.path.exists(path):
             print(f"Loading model from {path}")
-            model = models.load_model(path)
+            try:
+                # 嘗試載入模型
+                # 注意：如果遇到 bad marshal data 錯誤，通常是因為 Python 版本不兼容或 Lambda 函數序列化問題
+                # 在這種情況下，最簡單的方法是重建模型並載入權重，而不是載入整個模型結構
+                model = models.load_model(path, safe_mode=False)
+            except (TypeError, ValueError, Exception) as e:
+                print(f"Warning: Failed to load model structure directly ({e}). Rebuilding model and loading weights...")
+                # 如果載入失敗，則重新建構模型並嘗試只載入權重
+                model = self.build_model()
+                try:
+                    model.load_weights(path)
+                    print("Weights loaded successfully.")
+                except Exception as w_e:
+                    print(f"Error loading weights: {w_e}")
+                    print("Creating new model instead.")
+                    return self.build_model()
+                
             # 強制重新編譯以啟用 run_eagerly=True
             model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
                           loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
@@ -135,23 +154,81 @@ class AlphaZeroNetwork:
             return self.build_model()
 
     def build_model(self):
-        input_layer = layers.Input(shape=(self.input_dim,))
-        x = layers.Dense(512, activation='relu')(input_layer)
-        x = layers.Dropout(0.3)(x)
-        x = layers.Dense(256, activation='relu')(x)
-        x = layers.Dropout(0.3)(x)
+        # 1. Inputs
+        # Node Features: (Batch, N, 12) [9 for val + 3 for owner]
+        node_input = Input(shape=(self.num_nodes, 12), name='node_input')
+        # Adjacency Matrix: (Batch, N, N)
+        adj_input = Input(shape=(self.num_nodes, self.num_nodes), name='adj_input')
+        # Hand Features: (Batch, 27) [3 cards * 9]
+        hand_input = Input(shape=(27,), name='hand_input')
+        # Action Mask: (Batch, Num_Actions)
+        mask_input = Input(shape=(self.num_actions,), name='mask_input')
+
+        # 2. Feature Fusion (Broadcasting)
+        # Reshape Hand: (Batch, 27) -> (Batch, 1, 27)
+        hand_reshaped = layers.Reshape((1, 27))(hand_input)
+        # Tile: (Batch, N, 27)
+        # Note: Keras Tile layer or Lambda with tf.tile
+        # Capture num_nodes in a local variable to avoid capturing 'self' in lambda
+        n_nodes = self.num_nodes
+        hand_tiled = layers.Lambda(lambda x: tf.tile(x, [1, n_nodes, 1]))(hand_reshaped)
         
-        policy = layers.Dense(self.num_actions, activation='softmax', name='policy')(x)
-        value = layers.Dense(1, activation='tanh', name='value')(x)
+        # Concatenate: (Batch, N, 12+27=39)
+        x = layers.Concatenate()([node_input, hand_tiled])
+
+        # 3. GNN Backbone (Message Passing)
+        # Stack 3 GNN blocks
+        for i in range(3):
+            # Aggregate: A * X -> (Batch, N, F)
+            # Dot axes=(2, 1) means: adj[..., i, k] * x[..., k, j] -> out[..., i, j]
+            x_agg = layers.Dot(axes=(2, 1))([adj_input, x])
+            
+            # Concatenate: (Batch, N, 2F)
+            x_combined = layers.Concatenate()([x, x_agg])
+            
+            # Update: Dense
+            x = layers.Dense(256, activation='relu')(x_combined)
+            x = layers.BatchNormalization()(x)
+            x = layers.Dropout(0.2)(x)
+
+        # 4. Output Heads
         
-        model = models.Model(inputs=input_layer, outputs=[policy, value])
+        # Policy Head (Node-wise Prediction)
+        # We need to predict 3 cards for each node -> 3 logits per node
+        # (Batch, N, 3)
+        policy_logits_node = layers.Dense(3)(x)
+        
+        # Flatten to (Batch, N*3) which is (Batch, Num_Actions)
+        policy_logits = layers.Flatten()(policy_logits_node)
+        
+        # Apply Masking
+        # valid moves keep logits, invalid moves get -1e9
+        # mask is 1.0 for valid, 0.0 for invalid
+        # (1 - mask) * -1e9
+        inf_mask = layers.Lambda(lambda m: (1.0 - m) * -1e9)(mask_input)
+        masked_logits = layers.Add()([policy_logits, inf_mask])
+        
+        policy_out = layers.Activation('softmax', name='policy')(masked_logits)
+        
+        # Value Head (Global Graph Prediction)
+        # Global Average Pooling: (Batch, N, F) -> (Batch, F)
+        global_pool = layers.GlobalAveragePooling1D()(x)
+        
+        v = layers.Dense(128, activation='relu')(global_pool)
+        v = layers.Dropout(0.3)(v)
+        value_out = layers.Dense(1, activation='tanh', name='value')(v)
+        
+        model = Model(inputs=[node_input, adj_input, hand_input, mask_input], 
+                      outputs=[policy_out, value_out])
+        
         model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
                       loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
                       run_eagerly=True)
         return model
 
-    def predict(self, state_tensor):
-        outputs = self.model.predict_on_batch(state_tensor)
+    def predict(self, inputs):
+        # inputs is a list: [nodes, adj, hand, mask]
+        outputs = self.model.predict_on_batch(inputs)
         if hasattr(outputs[0], 'numpy'):
             policy_logits = outputs[0].numpy()
             value = outputs[1].numpy()
@@ -165,6 +242,7 @@ class AlphaZeroNetwork:
         print(f"Model saved to {path}")
     
     def fit(self, states, targets, **kwargs):
+        # states is a list of arrays [nodes, adj, hand, mask]
         return self.model.fit(states, targets, **kwargs)
 
 
@@ -172,13 +250,39 @@ class MoonZeroAdapter:
     """
     負責遊戲狀態與神經網路輸入/輸出之間的轉換
     """
-    def __init__(self, num_actions):
+    def __init__(self, num_actions, adj_map=None):
         self.num_actions = num_actions
+        self.adj_map = adj_map if adj_map else DEFAULT_BOARD.adj_map
+        self.num_nodes = len(self.adj_map)
+        self._build_adj_matrix()
+
+    def _build_adj_matrix(self):
+        # Create Adjacency Matrix (N, N)
+        # Row-normalized with self-loops
+        adj = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
+        
+        sorted_ids = sorted(self.adj_map.keys())
+        id_to_idx = {nid: i for i, nid in enumerate(sorted_ids)}
+        
+        for nid, neighbors in self.adj_map.items():
+            i = id_to_idx[nid]
+            # Self-loop
+            adj[i, i] = 1.0
+            for neighbor in neighbors:
+                if neighbor in id_to_idx:
+                    j = id_to_idx[neighbor]
+                    adj[i, j] = 1.0
+        
+        # Row Normalization (D^-1 * A)
+        row_sums = adj.sum(axis=1, keepdims=True)
+        # Avoid division by zero (though self-loops prevent this)
+        row_sums[row_sums == 0] = 1.0
+        self.adj_matrix = adj / row_sums
 
     def encode_state(self, game_state, player):
         """
-        將遊戲狀態編碼為向量。
-        支援 game_state 為 dict 或 MoonPhaseGame 物件。
+        將遊戲狀態編碼為 4 個輸入向量。
+        回傳: [node_features, adj_matrix, hand_features, mask]
         """
         if isinstance(game_state, MoonPhaseGame):
             nodes = game_state.nodes
@@ -187,10 +291,10 @@ class MoonZeroAdapter:
             nodes = game_state['nodes']
             hand = game_state['hand']
             
-        features = []
         sorted_ids = sorted(nodes.keys())
         
-        # 1. Node Features
+        # 1. Node Features (Batch, N, 12)
+        node_features = []
         for nid in sorted_ids:
             data = nodes[nid]
             # Value: 0-7 (one-hot), None -> 8
@@ -199,7 +303,6 @@ class MoonZeroAdapter:
                 val_vec[8] = 1
             else:
                 val_vec[data['val']] = 1
-            features.extend(val_vec)
             
             # Owner: P1, P2, None (one-hot relative to current player)
             # 0: Self, 1: Opponent, 2: None
@@ -210,23 +313,34 @@ class MoonZeroAdapter:
                 owner_vec[0] = 1
             else:
                 owner_vec[1] = 1
-            features.extend(owner_vec)
             
-        # 2. Hand Features (3 cards, each 0-7 or None)
-        # One-hot 9 dim per card slot
+            node_features.append(val_vec + owner_vec)
+            
+        node_tensor = np.array(node_features, dtype=np.float32).reshape(1, self.num_nodes, 12)
+        
+        # 2. Adjacency Matrix (Batch, N, N)
+        adj_tensor = self.adj_matrix.reshape(1, self.num_nodes, self.num_nodes).astype(np.float32)
+        
+        # 3. Hand Features (Batch, 27)
+        hand_vec = []
         for card in hand:
             c_vec = [0]*9
             if card is None:
                 c_vec[8] = 1
             else:
                 c_vec[card] = 1
-            features.extend(c_vec)
+            hand_vec.extend(c_vec)
         
         # Pad hand if less than 3
         for _ in range(3 - len(hand)):
-            features.extend([0]*8 + [1])
-
-        return np.array(features).reshape(1, -1)
+            hand_vec.extend([0]*8 + [1])
+            
+        hand_tensor = np.array(hand_vec, dtype=np.float32).reshape(1, 27)
+        
+        # 4. Action Mask (Batch, Num_Actions)
+        mask_tensor = self.get_valid_moves_mask(game_state).reshape(1, self.num_actions).astype(np.float32)
+        
+        return [node_tensor, adj_tensor, hand_tensor, mask_tensor]
 
     def decode_action(self, action_idx, game_state):
         """
@@ -394,17 +508,18 @@ class AlphazeroAI(AIPlayer):
     AlphaZero Agent
     協調 Network, Adapter 和 MCTS 進行決策
     """
-    def __init__(self, name: str, model_path: str = None, input_dim=None, num_actions=None):
+    def __init__(self, name: str, model_path: str = None, input_dim=None, num_actions=None, adj_map=None):
         super().__init__(name)
         if not TF_AVAILABLE:
             raise ImportError("TensorFlow is required for AlphazeroAI")
             
-        self.input_dim = input_dim
         self.num_actions = num_actions
+        self.adj_map = adj_map if adj_map else DEFAULT_BOARD.adj_map
+        self.num_nodes = len(self.adj_map)
         
         # 初始化組件
-        self.network = AlphaZeroNetwork(input_dim, num_actions, model_path)
-        self.adapter = MoonZeroAdapter(num_actions)
+        self.network = AlphaZeroNetwork(self.num_nodes, num_actions, model_path)
+        self.adapter = MoonZeroAdapter(num_actions, self.adj_map)
         self.mcts = MCTS(self.network, self.adapter)
         
         # 為了相容性，保留 model 屬性指向 network.model

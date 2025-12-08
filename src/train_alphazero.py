@@ -125,7 +125,9 @@ def self_play(ai, num_games=5, on_move_callback=None):
 
 def train(on_move_callback=None):
     print("Initializing AlphaZero AI...")
-    ai = AlphazeroAI("Trainer", model_path=MODEL_PATH, input_dim=INPUT_DIM, num_actions=NUM_ACTIONS)
+    # input_dim is no longer used but kept for signature compatibility if needed, or we can remove it.
+    # We pass None for input_dim as it's not used in the new GNN architecture.
+    ai = AlphazeroAI("Trainer", model_path=MODEL_PATH, input_dim=None, num_actions=NUM_ACTIONS)
     
     # 如果模型不存在，先編譯並儲存一次
     if not os.path.exists(MODEL_PATH):
@@ -161,28 +163,41 @@ def train(on_move_callback=None):
             continue
             
         # 2. Prepare Data
-        # 強制轉換為 float32 並調整形狀，避免 Keras 類型錯誤
-        states = np.vstack([d[0] for d in data]).astype(np.float32)
+        # data[i] = (state_inputs, policy, value)
+        # state_inputs = [node_tensor, adj_tensor, hand_tensor, mask_tensor]
+        
+        nodes = np.vstack([d[0][0] for d in data]).astype(np.float32)
+        adj = np.vstack([d[0][1] for d in data]).astype(np.float32)
+        hand = np.vstack([d[0][2] for d in data]).astype(np.float32)
+        mask = np.vstack([d[0][3] for d in data]).astype(np.float32)
+        
         policies = np.vstack([d[1] for d in data]).astype(np.float32)
         values = np.array([d[2] for d in data]).astype(np.float32).reshape(-1, 1)
         
         # 3. Train
         print(f"Training on {len(data)} samples...")
-        print(f"Data Shapes - States: {states.shape}, Policies: {policies.shape}, Values: {values.shape}")
+        # print(f"Data Shapes - States: {states.shape}, Policies: {policies.shape}, Values: {values.shape}")
         
         try:
-            history = ai.model.fit(states, {'policy': policies, 'value': values}, epochs=2, batch_size=32, verbose=1)
+            # Pass list of inputs for GNN
+            # verbose=0 to suppress progress bar spam in notebooks
+            history = ai.model.fit(
+                [nodes, adj, hand, mask], 
+                {'policy': policies, 'value': values}, 
+                epochs=2, 
+                batch_size=32, 
+                verbose=1
+            )
             
             # Record loss
             epoch_losses = {k: np.mean(v) for k, v in history.history.items()}
             loss_history.append(epoch_losses)
             
+            # Manual print for cleaner output
+            print(f"  > Training Loss: {epoch_losses['loss']:.4f} (Policy: {epoch_losses['policy_loss']:.4f}, Value: {epoch_losses['value_loss']:.4f})")
+            
         except Exception as e:
             print(f"Error during model.fit: {e}")
-            # 嘗試印出更多除錯資訊
-            print(f"States dtype: {states.dtype}")
-            print(f"Policies dtype: {policies.dtype}")
-            print(f"Values dtype: {values.dtype}")
             raise e
         
         # 4. Save

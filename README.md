@@ -617,6 +617,12 @@ sys.exit(app.exec_())
 - ✅ **訓練歷程紀錄**：`train_alphazero.py` 新增 `training_history.pkl` 機制，自動儲存 Loss 曲線與對戰結果，並支援斷點續訓。
 - ✅ **數據分析工具**：更新 `Moon_Game_Launcher.ipynb`，新增訓練數據視覺化功能，可直接繪製 Loss 趨勢圖與勝率變化曲線。
 
+### 版本 1.5 - GNN 架構升級
+- ✅ **圖神經網路 (GNN)**：將 AlphaZero 的核心網路從 MLP/CNN 升級為 Graph Neural Network。
+- ✅ **多模態輸入**：模型現在同時接收節點特徵、鄰接矩陣、手牌資訊與動作遮罩。
+- ✅ **Graph Broadcasting**：實現了全域手牌資訊對局部節點的廣播機制。
+- ✅ **拓撲適應性**：模型架構現在可以適應任意形狀的棋盤拓撲 (透過鄰接矩陣輸入)。
+
 ---
 
 ## 許可証與支持
