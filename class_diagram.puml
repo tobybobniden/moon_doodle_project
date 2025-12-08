@@ -1,0 +1,143 @@
+@startuml Moon Phase Strategy - Class Diagram
+
+title Moon Phase Strategy - 類別圖
+
+!theme plain
+skinparam backgroundColor #ffffff
+skinparam classBackgroundColor #f0f0f0
+skinparam classBorderColor #333333
+skinparam classArrowColor #333333
+skinparam fontSize 11
+
+' ============================================
+' AI 玩家框架
+' ============================================
+abstract class AIPlayer {
+    - name: str
+    --
+    + __init__(name: str)
+    + {abstract} decide_move(game_state: dict, player: str): tuple
+}
+
+class RandomAI {
+    - name: str (inherited)
+    --
+    + decide_move(game_state: dict, player: str): tuple
+}
+
+class GreedyAI {
+    - name: str (inherited)
+    --
+    + decide_move(game_state: dict, player: str): tuple
+    - _evaluate_move(node_id: int, card_val: int, nodes: dict, adj_map: dict): int
+}
+
+AIPlayer <|-- RandomAI : 繼承
+AIPlayer <|-- GreedyAI : 繼承
+
+' ============================================
+' 遊戲邏輯 (Model)
+' ============================================
+class MoonPhaseGame {
+    - adj_map: dict
+    - nodes: dict {node_id: {'val': int, 'owner': str}}
+    - scores: dict {'P1': int, 'P2': int}
+    - deck: list [int]
+    - hands: dict {'P1': [int], 'P2': [int]}
+    - turn: str
+    - game_over: bool
+    --
+    + __init__(adj_map: dict)
+    - _draw(): int
+    + get_chains(start_node: int, current_val: int, step: int, visited: list): list
+    + calculate_impact(node_id: int, current_val: int, player: str): int
+    + play_move(node_id: int, card_idx: int): bool
+}
+
+' ============================================
+' 視覺化組件 (View)
+' ============================================
+class GameBoardWidget {
+    - game: MoonPhaseGame
+    - adj_map: dict
+    - pos: dict (NetworkX coordinates)
+    - node_radius: int
+    - padding: int
+    --
+    + __init__(adj_map: dict, game_instance: MoonPhaseGame)
+    + get_screen_coords(nx_coords: tuple): QPoint
+    + paintEvent(event: QPaintEvent)
+    + mousePressEvent(event: QMouseEvent)
+    --
+    node_clicked(nid: int) <<signal>>
+}
+
+' ============================================
+' 主控制器 (Controller)
+' ============================================
+class MainWindow {
+    - game: MoonPhaseGame
+    - board_widget: GameBoardWidget
+    - ai_players: dict {str: AIPlayer}
+    - selected_card_idx: int
+    - game_ended: bool
+    - hand_btns: list [QPushButton]
+    - hand_buttons_layout: QHBoxLayout
+    - game_control_container: QWidget
+    - game_over_container: QWidget
+    --
+    - lbl_p1_score: QLabel
+    - lbl_p2_score: QLabel
+    - lbl_turn: QLabel
+    - lbl_hand_msg: QLabel
+    - lbl_result: QLabel
+    - btn_retry: QPushButton
+    --
+    + __init__(ai_players: dict = None)
+    + update_ui()
+    + execute_ai_move()
+    + select_card(idx: int)
+    + on_node_click(node_id: int)
+    + show_game_over()
+    + restart_game()
+}
+
+' ============================================
+' 關係
+' ============================================
+
+MainWindow --> MoonPhaseGame : 包含
+MainWindow --> GameBoardWidget : 包含
+MainWindow --> AIPlayer : 使用 (ai_players)
+
+GameBoardWidget --> MoonPhaseGame : 參考
+GameBoardWidget --|> QWidget
+
+MainWindow --|> QMainWindow
+
+MoonPhaseGame ..> AIPlayer : 不直接相關
+
+' ============================================
+' 工具函數與常數
+' ============================================
+note right of AIPlayer
+  工具函數與常數：
+  • phase_to_color(phase_index: int) -> QColor
+    將月相索引映射到 HSL 漸層色
+  • PHASES: ["🌑", "🌒", ..., "🌘"] (8個月相)
+  • OWNER_COLORS: dict (P1綠色, P2粉紅, None灰色)
+  • CUSTOM_ADJ_MAP: dict (14節點圖結構)
+end note
+
+' ============================================
+' 説明
+' ============================================
+note bottom
+  MVC架構說明：
+  • Model: MoonPhaseGame (遊戲邏輯)
+  • View: GameBoardWidget (圖形化展示)
+  • Controller: MainWindow (事件處理)
+  • AI層: AIPlayer框架 (可插拔式AI控制)
+end note
+
+@enduml
