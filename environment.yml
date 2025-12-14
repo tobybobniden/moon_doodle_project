@@ -1,0 +1,17 @@
+name: moon_gpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - matplotlib
+  # 為了確保 GPU 支援最穩定，我們還是建議使用 pip 安裝官方包
+  # 但我們會透過設定「台灣鏡像站」來解決下載慢的問題
+  
+  - pip:
+    # [and-cuda] 會自動安裝所有需要的 NVIDIA 函式庫
+    - tensorflow[and-cuda]
+    - PyQt5
+    - networkx
+

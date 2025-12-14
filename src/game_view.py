@@ -121,7 +121,7 @@ class GameBoardWidget(QWidget):
                     painter.drawEllipse(right_point, marker_radius, marker_radius)
 
     def _draw_nodes(self, painter):
-        font = QFont("Microsoft JhengHei", 16, QFont.Weight.Bold)
+        font = QFont("WenQuanYi Micro Hei", 16, QFont.Weight.Bold)
         painter.setFont(font)
         
         for nid, data in self.game.nodes.items():
@@ -136,16 +136,13 @@ class GameBoardWidget(QWidget):
             painter.setPen(halo_pen)
             painter.drawEllipse(center, self.node_radius + 2, self.node_radius + 2)
             
-            # B. 月相本體（使用藍→紫漸層，並依月象循環調整明度）
+            # B. 月相本體（統一使用素色背景）
+            bg_color = QColor("#ecf0f1")
+            
             if val is not None:
-                bg_color = phase_to_color(val)
                 text = PHASES[val]
-                # 自動根據背景亮度決定文字顏色
-                r, g, b, _ = bg_color.getRgb()
-                luminance = 0.299 * r + 0.587 * g + 0.114 * b
-                text_color = Qt.black if luminance > 140 else Qt.white
+                text_color = Qt.black
             else:
-                bg_color = QColor("#ecf0f1")
                 text = str(nid)
                 text_color = Qt.gray # PyQt5: Qt.gray
                 

@@ -1,5 +1,11 @@
 import sys
 import time
+import os
+
+# --- 關鍵修復：禁用 Qt OpenGL 整合 ---
+# 解決 WSL2 + TensorFlow 環境下的 LLVM 版本衝突導致的 Segfault
+os.environ['QT_XCB_GL_INTEGRATION'] = 'none'
+
 # --- PyQt5 導入 ---
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QMessageBox, QFrame)
@@ -76,7 +82,7 @@ class MainWindow(QMainWindow):
         self.lbl_turn = QLabel("Turn: Player 1")
         
         for lbl in [self.lbl_p1_score, self.lbl_p2_score, self.lbl_turn]:
-            lbl.setFont(QFont("Microsoft JhengHei", 14, QFont.Weight.Bold))
+            lbl.setFont(QFont("WenQuanYi Micro Hei", 14, QFont.Weight.Bold))
             lbl.setFrameStyle(QFrame.Panel | QFrame.Sunken) 
             lbl.setMargin(5)
             
@@ -91,12 +97,12 @@ class MainWindow(QMainWindow):
         log_layout = QHBoxLayout()
         
         self.lbl_log_p1 = QLabel("P1: 就緒")
-        self.lbl_log_p1.setFont(QFont("Microsoft JhengHei", 20))
+        self.lbl_log_p1.setFont(QFont("WenQuanYi Micro Hei", 20))
         self.lbl_log_p1.setStyleSheet("color: #36a066; background-color: #222; padding: 5px; border-radius: 3px;")
         self.lbl_log_p1.setWordWrap(True)
         
         self.lbl_log_p2 = QLabel("P2: 就緒")
-        self.lbl_log_p2.setFont(QFont("Microsoft JhengHei", 20))
+        self.lbl_log_p2.setFont(QFont("WenQuanYi Micro Hei", 20))
         self.lbl_log_p2.setStyleSheet("color: #e73ca5; background-color: #222; padding: 5px; border-radius: 3px;")
         self.lbl_log_p2.setWordWrap(True)
         
@@ -122,12 +128,12 @@ class MainWindow(QMainWindow):
         self.game_over_panel = QVBoxLayout()
         
         self.lbl_result = QLabel()
-        self.lbl_result.setFont(QFont("Microsoft JhengHei", 16, QFont.Weight.Bold))
+        self.lbl_result.setFont(QFont("WenQuanYi Micro Hei", 16, QFont.Weight.Bold))
         self.lbl_result.setAlignment(Qt.AlignCenter)
         self.game_over_panel.addWidget(self.lbl_result)
         
         btn_retry = QPushButton("重新開始")
-        btn_retry.setFont(QFont("Microsoft JhengHei", 12, QFont.Weight.Bold))
+        btn_retry.setFont(QFont("WenQuanYi Micro Hei", 12, QFont.Weight.Bold))
         btn_retry.clicked.connect(self.restart_game)
         self.game_over_panel.addWidget(btn_retry)
         
@@ -186,7 +192,7 @@ class MainWindow(QMainWindow):
         btn_text = f"{PHASES[card_val]} ({card_val})"
         btn = QPushButton(btn_text)
         btn.setFixedSize(100, 60)
-        btn.setFont(QFont("Microsoft JhengHei", 16))
+        btn.setFont(QFont("WenQuanYi Micro Hei", 16))
         
         if self.selected_card_idx == idx:
             btn.setStyleSheet(f"background-color: #f1c40f; border: 3px solid {color};")
@@ -253,6 +259,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "無效", "該位置已經有牌了，請選擇空位。")
 
     def show_game_over(self):
+        if self.game_ended: return
         self.game_ended = True
         s1, s2 = self.game.scores['P1'], self.game.scores['P2']
         

@@ -4,3 +4,4 @@ moon_project_class_diagram.png
 /logs/
 /models/
 *.pyc
+*.sh

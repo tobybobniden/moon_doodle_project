@@ -1,18 +1,31 @@
+import os
+# ⚠️ 必須在任何 TensorFlow 導入之前設定！
+# TensorFlow 2.15 在 CC 12.0 GPU 上有 PTX 編譯相容性問題
+# 模型建構時禁用 GPU，訓練時會自動使用 GPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  <-- 已註解，因為我們現在使用 tf-nightly 支援 GPU
+
 import random
 import numpy as np
 import copy
-import os
+import logging
+import tensorflow as tf
 from src.game_model import MoonPhaseGame
 from src.adj_map import DEFAULT_BOARD
 
 # 嘗試導入 TensorFlow，如果沒有安裝則優雅降級
 try:
-    from keras._tf_keras.keras import layers, models, optimizers, Input, Model
+    from keras import layers, models, optimizers, Input, Model
     import tensorflow as tf
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-    print("Warning: TensorFlow/Keras not found. AlphazeroAI will not work.")
+    logger = logging.getLogger(__name__)
+    logger.warning("TensorFlow/Keras not found. AlphazeroAI will not work.")
+
+# --- Logger Setup ---
+logger = logging.getLogger(__name__)
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 
 # --- AI 控制框架 ---
 class AIPlayer:
@@ -97,9 +110,10 @@ class GreedyAI(AIPlayer):
         return best_move
     
     def _evaluate_move(self, node_id: int, card_val: int, nodes: dict, adj_map: dict) -> int:
-        """評估在某個位置放置某張牌的分數"""
+        """評估在某個位置放置某張牌的分數 (包括月週期)"""
         score = 0
         
+        # === 部分 1：相鄰配對 (Pair Bonuses) ===
         for neighbor_id in adj_map.get(node_id, []):
             neighbor = nodes[neighbor_id]
             if neighbor['val'] is None:
@@ -111,7 +125,59 @@ class GreedyAI(AIPlayer):
             elif card_val == neighbor['val']:
                 score += 1
         
+        # === 部分 2：月週期檢查 (Chain Detection) ===
+        # 月週期分為兩個方向：順向 (card_val+1, +2, ...) 和逆向 (card_val-1, -2, ...)
+        chains_forward = self._find_chains(node_id, card_val, 1, nodes, adj_map)
+        chains_backward = self._find_chains(node_id, card_val, -1, nodes, adj_map)
+        
+        # 月週期評分：每條連續序列長度 >= 2 時計分
+        for chain in chains_forward + chains_backward:
+            if len(chain) >= 2:
+                # 連續序列長度計分 (例如 3 個連續 = +3)
+                score += len(chain)
+        
         return score
+    
+    def _find_chains(self, start_node, current_val, step, nodes, adj_map):
+        """
+        DFS 尋找特定方向的連續月相序列
+        
+        參數:
+            start_node: 起始節點
+            current_val: 當前月相值 (0-7)
+            step: 步長 (+1 順向, -1 逆向)
+            nodes: 遊戲節點字典
+            adj_map: 鄰接關係
+        
+        回傳:
+            chains: 找到的所有序列列表，每個序列是節點 ID 列表
+        """
+        valid_chains = []
+        visited = set()
+        
+        # BFS 找出所有連續節點
+        queue = [(start_node, [start_node], current_val)]
+        
+        while queue:
+            node, path, val = queue.pop(0)
+            
+            # 計算下一個月相值
+            next_val = (val + step) % 8
+            
+            # 尋找鄰接點中是否有下一個月相值
+            found_next = False
+            for neighbor in adj_map.get(node, []):
+                if neighbor not in visited and nodes[neighbor]['val'] == next_val:
+                    found_next = True
+                    new_path = path + [neighbor]
+                    visited.add(neighbor)
+                    queue.append((neighbor, new_path, next_val))
+            
+            # 如果沒有找到下一個，這個路徑是一條完整的序列
+            if not found_next and len(path) > 1:
+                valid_chains.append(path)
+        
+        return valid_chains
 
 
 class AlphaZeroNetwork:
@@ -144,10 +210,10 @@ class AlphaZeroNetwork:
                     print("Creating new model instead.")
                     return self.build_model()
                 
-            # 強制重新編譯以啟用 run_eagerly=True
+            # 強制重新編譯以啟用 run_eagerly=False (Graph Mode 加速)
             model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
                           loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
-                          run_eagerly=True)
+                          run_eagerly=False)
             return model
         else:
             print("Creating new model")
@@ -159,21 +225,21 @@ class AlphaZeroNetwork:
         node_input = Input(shape=(self.num_nodes, 12), name='node_input')
         # Adjacency Matrix: (Batch, N, N)
         adj_input = Input(shape=(self.num_nodes, self.num_nodes), name='adj_input')
-        # Hand Features: (Batch, 27) [3 cards * 9]
-        hand_input = Input(shape=(27,), name='hand_input')
+        # Hand Features: (Batch, 29) [3 cards * 9 + 2 scores]
+        hand_input = Input(shape=(29,), name='hand_input')
         # Action Mask: (Batch, Num_Actions)
         mask_input = Input(shape=(self.num_actions,), name='mask_input')
 
         # 2. Feature Fusion (Broadcasting)
-        # Reshape Hand: (Batch, 27) -> (Batch, 1, 27)
-        hand_reshaped = layers.Reshape((1, 27))(hand_input)
-        # Tile: (Batch, N, 27)
+        # Reshape Hand: (Batch, 29) -> (Batch, 1, 29)
+        hand_reshaped = layers.Reshape((1, 29))(hand_input)
+        # Tile: (Batch, N, 29)
         # Note: Keras Tile layer or Lambda with tf.tile
         # Capture num_nodes in a local variable to avoid capturing 'self' in lambda
         n_nodes = self.num_nodes
         hand_tiled = layers.Lambda(lambda x: tf.tile(x, [1, n_nodes, 1]))(hand_reshaped)
         
-        # Concatenate: (Batch, N, 12+27=39)
+        # Concatenate: (Batch, N, 12+29=41)
         x = layers.Concatenate()([node_input, hand_tiled])
 
         # 3. GNN Backbone (Message Passing)
@@ -223,7 +289,7 @@ class AlphaZeroNetwork:
         
         model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
                       loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
-                      run_eagerly=True)
+                      run_eagerly=False)
         return model
 
     def predict(self, inputs):
@@ -321,7 +387,7 @@ class MoonZeroAdapter:
         # 2. Adjacency Matrix (Batch, N, N)
         adj_tensor = self.adj_matrix.reshape(1, self.num_nodes, self.num_nodes).astype(np.float32)
         
-        # 3. Hand Features (Batch, 27)
+        # 3. Hand Features (Batch, 29) -> 27 cards + 2 scores
         hand_vec = []
         for card in hand:
             c_vec = [0]*9
@@ -335,7 +401,27 @@ class MoonZeroAdapter:
         for _ in range(3 - len(hand)):
             hand_vec.extend([0]*8 + [1])
             
-        hand_tensor = np.array(hand_vec, dtype=np.float32).reshape(1, 27)
+        # --- Fix: Add Scores to Global Features ---
+        # Normalize scores (assuming max score ~50 for normalization stability)
+        if isinstance(game_state, MoonPhaseGame):
+            s1 = game_state.scores.get('P1', 0) / 50.0
+            s2 = game_state.scores.get('P2', 0) / 50.0
+            # Ensure relative perspective: [My Score, Opponent Score]
+            if player == 'P1':
+                hand_vec.extend([s1, s2])
+            else:
+                hand_vec.extend([s2, s1])
+        else:
+            # Fallback for dict state
+            scores = game_state.get('scores', {'P1': 0, 'P2': 0})
+            s1 = scores.get('P1', 0) / 50.0
+            s2 = scores.get('P2', 0) / 50.0
+            if player == 'P1':
+                hand_vec.extend([s1, s2])
+            else:
+                hand_vec.extend([s2, s1])
+
+        hand_tensor = np.array(hand_vec, dtype=np.float32).reshape(1, 29)
         
         # 4. Action Mask (Batch, Num_Actions)
         mask_tensor = self.get_valid_moves_mask(game_state).reshape(1, self.num_actions).astype(np.float32)
@@ -527,7 +613,7 @@ class AlphazeroAI(AIPlayer):
 
     def decide_move(self, game_state: dict, player: str, training=False) -> tuple:
         # 1. 執行 MCTS
-        root = self.mcts.search(game_state, player, num_simulations=50 if training else 200)
+        root = self.mcts.search(game_state, player, num_simulations=200)
         
         # 2. 根據訪問次數選擇動作
         temperature = 1.0 if training else 0.1
