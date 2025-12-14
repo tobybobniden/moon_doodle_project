@@ -11,7 +11,6 @@ import logging
 import tensorflow as tf
 from src.game_model import MoonPhaseGame
 from src.adj_map import DEFAULT_BOARD
-
 # 嘗試導入 TensorFlow，如果沒有安裝則優雅降級
 try:
     from keras import layers, models, optimizers, Input, Model
@@ -20,7 +19,7 @@ try:
 except ImportError:
     TF_AVAILABLE = False
     logger = logging.getLogger(__name__)
-    logger.warning("TensorFlow/Keras not found. AlphazeroAI will not work.")
+    logger.warning("TensorFlow/Keras not found. StudentOfGamesAI will not work.")
 
 # --- Logger Setup ---
 logger = logging.getLogger(__name__)
@@ -180,7 +179,7 @@ class GreedyAI(AIPlayer):
         return valid_chains
 
 
-class AlphaZeroNetwork:
+class SOGNetwork:
     """
     負責神經網路的建構、載入與預測
     使用 Graph Neural Network (GNN) 架構
@@ -205,15 +204,17 @@ class AlphaZeroNetwork:
                 try:
                     model.load_weights(path)
                     print("Weights loaded successfully.")
+                    # Rebuild case: Must compile
+                    model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
+                                  loss={'policy': 'categorical_crossentropy', 'value': tf.keras.losses.Huber()},
+                                  run_eagerly=False)
                 except Exception as w_e:
                     print(f"Error loading weights: {w_e}")
                     print("Creating new model instead.")
                     return self.build_model()
                 
-            # 強制重新編譯以啟用 run_eagerly=False (Graph Mode 加速)
-            model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
-                          loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
-                          run_eagerly=False)
+            # If load_model succeeded, we assume it loaded the optimizer state too.
+            # We do NOT re-compile here to avoid resetting the optimizer.
             return model
         else:
             print("Creating new model")
@@ -243,8 +244,8 @@ class AlphaZeroNetwork:
         x = layers.Concatenate()([node_input, hand_tiled])
 
         # 3. GNN Backbone (Message Passing)
-        # Stack 3 GNN blocks
-        for i in range(3):
+        # Stack 8 GNN blocks (Updated from 3 to 8 as per SOG report)
+        for i in range(8):
             # Aggregate: A * X -> (Batch, N, F)
             # Dot axes=(2, 1) means: adj[..., i, k] * x[..., k, j] -> out[..., i, j]
             x_agg = layers.Dot(axes=(2, 1))([adj_input, x])
@@ -288,7 +289,7 @@ class AlphaZeroNetwork:
                       outputs=[policy_out, value_out])
         
         model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
-                      loss={'policy': 'categorical_crossentropy', 'value': 'mean_squared_error'},
+                      loss={'policy': 'categorical_crossentropy', 'value': tf.keras.losses.Huber()},
                       run_eagerly=False)
         return model
 
@@ -312,7 +313,7 @@ class AlphaZeroNetwork:
         return self.model.fit(states, targets, **kwargs)
 
 
-class MoonZeroAdapter:
+class SOGAdapter:
     """
     負責遊戲狀態與神經網路輸入/輸出之間的轉換
     """
@@ -473,14 +474,20 @@ class MoonZeroAdapter:
         return mask
 
 
-class MCTSNode:
+class SOGNode:
     def __init__(self, parent=None, prior=0):
         self.parent = parent
-        self.children = {}  # {action_idx: MCTSNode}
+        self.children = {}  # {action_idx: SOGNode}
         self.visit_count = 0
         self.value_sum = 0
         self.prior = prior
         
+        # SOG / CFR specific
+        self.regret_sum = 0.0
+        self.strategy_sum = 0.0
+        self.regrets = {} # {action_idx: cumulative_regret}
+        self.policy_sum = {} # {action_idx: cumulative_policy}
+
     @property
     def value(self):
         return self.value_sum / (self.visit_count + 1e-6)
@@ -489,135 +496,196 @@ class MCTSNode:
         return len(self.children) == 0
 
 
-class MCTS:
+class SOGSearch:
+    """
+    Student of Games (SOG) Search Implementation
+    Uses a simplified Growing-Tree CFR (GT-CFR) approach.
+    """
     def __init__(self, network, adapter):
         self.network = network
         self.adapter = adapter
         
     def search(self, game_state, player, num_simulations):
-        root = MCTSNode()
+        root = SOGNode()
         
-        # 準備初始模擬狀態
+        # Prepare initial state
         if isinstance(game_state, dict) and 'game_obj' in game_state:
             initial_game = game_state['game_obj'].clone()
         elif isinstance(game_state, MoonPhaseGame):
             initial_game = game_state.clone()
         else:
-            print("Warning: MCTS requires 'game_obj' in game_state for accurate simulation.")
+            print("Warning: SOG requires 'game_obj' in game_state.")
             return root
             
         for _ in range(num_simulations):
-            node = root
-            sim_game = initial_game.clone()
-            
-            # 1. Selection
-            while not node.is_leaf():
-                action_idx, node = self._select_child(node)
-                move = self.adapter.decode_action(action_idx, sim_game)
-                if move:
-                    card_idx, node_id = move
-                    sim_game.play_move(node_id, card_idx)
-            
-            # 2. Expansion & Evaluation
-            if sim_game.game_over:
-                s1 = sim_game.scores['P1']
-                s2 = sim_game.scores['P2']
-                if s1 > s2: winner = 'P1'
-                elif s2 > s1: winner = 'P2'
-                else: winner = 'Draw'
-                
-                if winner == 'Draw': value = 0
-                else: value = 1 if winner == player else -1
-            else:
-                # Predict with NN
-                state_tensor = self.adapter.encode_state(sim_game, sim_game.turn)
-                policy_logits, value = self.network.predict(state_tensor)
-                
-                policy_probs = policy_logits[0]
-                value = value[0][0]
-                
-                # Mask invalid moves
-                valid_mask = self.adapter.get_valid_moves_mask(sim_game)
-                policy_probs = policy_probs * valid_mask
-                sum_probs = np.sum(policy_probs)
-                if sum_probs > 0:
-                    policy_probs /= sum_probs
-                else:
-                    policy_probs = valid_mask / np.sum(valid_mask)
-                
-                # Expand
-                for action_idx, prob in enumerate(policy_probs):
-                    if prob > 0:
-                        node.children[action_idx] = MCTSNode(parent=node, prior=prob)
-            
-            # 3. Backup
-            while node is not None:
-                node.visit_count += 1
-                node.value_sum += value
-                node = node.parent
-                value = -value # 對手視角反轉
+            self._cfr_iteration(root, initial_game.clone(), player)
                 
         return root
 
-    def _select_child(self, node):
-        best_score = -float('inf')
-        best_action = -1
-        best_child = None
+    def _cfr_iteration(self, node, game, root_player):
+        # 1. Terminal State Check
+        if game.game_over:
+            s1 = game.scores['P1']
+            s2 = game.scores['P2']
+            if s1 > s2: winner = 'P1'
+            elif s2 > s1: winner = 'P2'
+            else: winner = 'Draw'
+            
+            if winner == 'Draw': return 0
+            # Return value from the perspective of the current node's player
+            return 1 if winner == game.turn else -1
+
+        # 2. Expansion (if leaf)
+        if node.is_leaf():
+            # Predict with NN
+            state_tensor = self.adapter.encode_state(game, game.turn)
+            policy_logits, value = self.network.predict(state_tensor)
+            
+            policy_probs = policy_logits[0]
+            value = value[0][0] # Value for current player
+            
+            # Mask invalid moves
+            valid_mask = self.adapter.get_valid_moves_mask(game)
+            policy_probs = policy_probs * valid_mask
+            sum_probs = np.sum(policy_probs)
+            if sum_probs > 0:
+                policy_probs /= sum_probs
+            else:
+                policy_probs = valid_mask / np.sum(valid_mask)
+            
+            # Expand children
+            for action_idx, prob in enumerate(policy_probs):
+                if prob > 0:
+                    node.children[action_idx] = SOGNode(parent=node, prior=prob)
+                    node.regrets[action_idx] = 0.0
+                    node.policy_sum[action_idx] = 0.0
+            
+            return value
+
+        # 3. Regret Matching (Selection)
+        # Calculate current strategy from regrets
+        actions = list(node.children.keys())
         
-        for action, child in node.children.items():
-            ucb = child.value + 1.0 * child.prior * np.sqrt(node.visit_count) / (1 + child.visit_count)
-            if ucb > best_score:
-                best_score = ucb
-                best_action = action
-                best_child = child
+        # Regret Matching+: max(R, 0)
+        regrets = np.array([max(node.regrets[a], 0) for a in actions])
+        sum_regrets = np.sum(regrets)
         
-        return best_action, best_child
+        if sum_regrets > 0:
+            strategy = regrets / sum_regrets
+        else:
+            # If no positive regrets, use uniform or prior
+            strategy = np.array([node.children[a].prior for a in actions])
+            sum_prior = np.sum(strategy)
+            if sum_prior > 0: strategy /= sum_prior
+            else: strategy = np.ones(len(actions)) / len(actions)
+            
+        # Sample action based on strategy
+        action_idx = np.random.choice(actions, p=strategy)
+        child = node.children[action_idx]
+        
+        # 4. Recursive Call
+        move = self.adapter.decode_action(action_idx, game)
+        if move:
+            card_idx, node_id = move
+            game.play_move(node_id, card_idx)
+            
+        # Value returned is from the perspective of the NEXT player (opponent)
+        # So we negate it to get value for CURRENT player
+        child_value = -self._cfr_iteration(child, game, root_player)
+        
+        # 5. Update Regrets & Strategy Sum
+        # Update visit count and value sum (MCTS-like stats for debugging/fallback)
+        child.visit_count += 1
+        child.value_sum += child_value
+        
+        # Calculate V(s) = sum(sigma(a) * Q(s, a))
+        # We need Q(s, a) for all actions to update regrets.
+        # Since we only explored one action, we use the child's value estimate as Q(s, a).
+        # For unvisited children, we can use their value_sum/visit_count or 0.
+        
+        q_values = {}
+        for a in actions:
+            child_node = node.children[a]
+            if child_node.visit_count > 0:
+                q_values[a] = child_node.value
+            else:
+                # For unvisited nodes, assume 0 or parent value? 
+                # Let's use 0 for zero-sum game as neutral.
+                q_values[a] = 0.0
+        
+        # Override the Q-value for the action we just took with the fresh sample?
+        # Or just use the accumulated average which is more stable.
+        # Let's use the accumulated average (child.value) which includes the latest sample.
+        
+        node_value = sum(strategy[i] * q_values[a] for i, a in enumerate(actions))
+        
+        for i, a in enumerate(actions):
+            # Regret Update: R(s, a) += Q(s, a) - V(s)
+            r = q_values[a] - node_value
+            node.regrets[a] += r
+            
+            # Update cumulative policy (for average strategy)
+            # We weight by iteration t (here just +1)
+            node.policy_sum[a] += strategy[i]
+            
+        return child_value
 
     def select_action(self, root, temperature=1.0):
         if not root.children:
             return np.random.choice(range(self.adapter.num_actions))
 
-        visits = [child.visit_count for child in root.children.values()]
+        # In SOG/CFR, we select based on the Average Strategy (Policy Sum)
         actions = list(root.children.keys())
+        policy_sums = np.array([root.policy_sum[a] for a in actions])
         
+        sum_policy = np.sum(policy_sums)
+        if sum_policy > 0:
+            probs = policy_sums / sum_policy
+        else:
+            probs = np.ones(len(actions)) / len(actions)
+            
         if temperature == 0:
-            return actions[np.argmax(visits)]
+            return actions[np.argmax(probs)]
         
-        visits = np.array(visits)
-        probs = visits ** (1 / temperature)
-        probs /= np.sum(probs)
+        if temperature != 1.0:
+            probs = probs ** (1 / temperature)
+            probs /= np.sum(probs)
+            
         return np.random.choice(actions, p=probs)
 
 
-class AlphazeroAI(AIPlayer):
+class StudentOfGamesAI(AIPlayer):
     """
-    AlphaZero Agent
-    協調 Network, Adapter 和 MCTS 進行決策
+    Student of Games (SOG) Agent
+    協調 Network, Adapter 和 Search Algorithm 進行決策
     """
     def __init__(self, name: str, model_path: str = None, input_dim=None, num_actions=None, adj_map=None):
         super().__init__(name)
         if not TF_AVAILABLE:
-            raise ImportError("TensorFlow is required for AlphazeroAI")
+            raise ImportError("TensorFlow is required for StudentOfGamesAI")
             
         self.num_actions = num_actions
         self.adj_map = adj_map if adj_map else DEFAULT_BOARD.adj_map
         self.num_nodes = len(self.adj_map)
         
         # 初始化組件
-        self.network = AlphaZeroNetwork(self.num_nodes, num_actions, model_path)
-        self.adapter = MoonZeroAdapter(num_actions, self.adj_map)
-        self.mcts = MCTS(self.network, self.adapter)
+        self.network = SOGNetwork(self.num_nodes, num_actions, model_path)
+        self.adapter = SOGAdapter(num_actions, self.adj_map)
+        
+        # 使用 SOG Search
+        self.search_algo = SOGSearch(self.network, self.adapter)
         
         # 為了相容性，保留 model 屬性指向 network.model
         self.model = self.network.model
 
     def decide_move(self, game_state: dict, player: str, training=False) -> tuple:
-        # 1. 執行 MCTS
-        root = self.mcts.search(game_state, player, num_simulations=200)
+        # 1. 執行 Search (SOG/CFR)
+        # 增加模擬次數，因為 CFR 需要更多迭代來收斂策略
+        root = self.search_algo.search(game_state, player, num_simulations=200 if training else 400)
         
-        # 2. 根據訪問次數選擇動作
+        # 2. 根據平均策略選擇動作
         temperature = 1.0 if training else 0.1
-        action_idx = self.mcts.select_action(root, temperature)
+        action_idx = self.search_algo.select_action(root, temperature)
         
         # 3. 解碼動作
         return self.adapter.decode_action(action_idx, game_state)

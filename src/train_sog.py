@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pickle
 from src.game_model import MoonPhaseGame
-from src.ai_logic import AlphazeroAI, GreedyAI, RandomAI
+from src.ai_logic import StudentOfGamesAI, GreedyAI, RandomAI
 from src.adj_map import DEFAULT_BOARD
 
 # Configuration
@@ -24,7 +24,7 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 if not os.path.exists(MODELS_DIR):
     os.makedirs(MODELS_DIR)
 
-MODEL_PATH = os.path.join(MODELS_DIR, "alphazero_model.h5")
+MODEL_PATH = os.path.join(MODELS_DIR, "sog_model.keras")
 HISTORY_PATH = os.path.join(MODELS_DIR, "training_history.pkl")
 
 def game_to_dict(game):
@@ -101,8 +101,8 @@ def generate_greedy_data(ai, num_games=10):
 
 def train_with_greedy(num_games=100, epochs=5):
     """使用 Greedy AI 進行快速預訓練"""
-    print("Initializing AlphaZero AI for Pre-training...")
-    ai = AlphazeroAI("Trainer", model_path=MODEL_PATH, input_dim=None, num_actions=NUM_ACTIONS)
+    print("Initializing StudentOfGamesAI for Pre-training...")
+    ai = StudentOfGamesAI("Trainer", model_path=MODEL_PATH, input_dim=None, num_actions=NUM_ACTIONS)
     
     if not os.path.exists(MODEL_PATH):
         ai.model.save(MODEL_PATH)
@@ -191,37 +191,20 @@ def _process_game_result(game, game_history, ai):
     
     print(f"Game finished. Winner: {winner}, Score: {s1}-{s2}")
     
-    score_diff = s1 - s2  # P1 視角的分數差
-    normalized_score_reward = np.clip(score_diff / 30.0, -1.0, 1.0)  # 規範化到 [-1, 1]
-    
     training_data = []
     # Unpack 4 values now: state, policy, player, immediate_score_gain
     for state, policy, player, score_gain in game_history:
         
+        # Pure Reward Signal as per SOG Report
+        # Use pure {-1, 0, 1} for Win/Draw/Loss
         if winner == 'Draw':
             final_value = 0.0
         elif winner == 'P1':
-            # P1 贏：P1 獲得正獎勵，P2 獲得負獎勵
-            # 獎勵 = 勝利(+1) + 分數優勢(±0.5)
-            if player == 'P1':
-                final_value = 1.0 + 0.5 * normalized_score_reward
-            else:  # player == 'P2'
-                final_value = -1.0 - 0.5 * normalized_score_reward
+            final_value = 1.0 if player == 'P1' else -1.0
         elif winner == 'P2':
-            # P2 贏：P2 獲得正獎勵，P1 獲得負獎勵
-            # 這是對稱的：-score_diff 從 P2 視角變成 +score_diff
-            if player == 'P2':
-                final_value = 1.0 - 0.5 * normalized_score_reward
-            else:  # player == 'P1'
-                final_value = -1.0 + 0.5 * normalized_score_reward
+            final_value = 1.0 if player == 'P2' else -1.0
         
-        # 2. 計算即時獎勵 (Short-term Goal) - 相對視角
-        # 鼓勵得分，但以雙方均衡的方式
-        immediate_value = np.clip(score_gain / 8.0, -1.0, 1.0)
-        
-        # 3. 混合獎勵 (Hybrid Reward) 
-        # 80% 勝負，20% 得分
-        value = 0.8 * final_value + 0.2 * immediate_value
+        value = final_value
         
         state_tensor = ai.encode_state(state, player)
         training_data.append((state_tensor, policy, value))
@@ -363,10 +346,10 @@ def self_play(ai, num_games=5, on_move_callback=None):
     return training_data, game_results
 
 def train(on_move_callback=None):
-    print("Initializing AlphaZero AI...")
+    print("Initializing StudentOfGamesAI...")
     # input_dim is no longer used but kept for signature compatibility if needed, or we can remove it.
     # We pass None for input_dim as it's not used in the new GNN architecture.
-    ai = AlphazeroAI("Trainer", model_path=MODEL_PATH, input_dim=None, num_actions=NUM_ACTIONS)
+    ai = StudentOfGamesAI("Trainer", model_path=MODEL_PATH, input_dim=None, num_actions=NUM_ACTIONS)
     
     # 如果模型不存在，先編譯並儲存一次
     if not os.path.exists(MODEL_PATH):
@@ -376,21 +359,25 @@ def train(on_move_callback=None):
     start_epoch = 0
     loss_history = []
     game_record = []
+    data_buffer = [] # Buffer for experience replay
+    BUFFER_SIZE = 20 # Keep last 20 iterations (approx 100 games)
     
     if os.path.exists(HISTORY_PATH):
         try:
             with open(HISTORY_PATH, 'rb') as f:
                 data = pickle.load(f)
-                # Assuming format: [epoch, loss_history, game_record]
+                # Format: [epoch, loss_history, game_record, data_buffer(optional)]
                 if len(data) >= 3:
                     start_epoch = data[0]
                     loss_history = data[1]
                     game_record = data[2]
-                    print(f"Loaded history: starting from epoch {start_epoch}")
+                    if len(data) >= 4:
+                        data_buffer = data[3]
+                        print(f"Loaded history with buffer: starting from epoch {start_epoch}, buffer size {len(data_buffer)}")
+                    else:
+                        print(f"Loaded history (no buffer): starting from epoch {start_epoch}")
         except Exception as e:
             print(f"Failed to load history: {e}")
-    
-    data_buffer = [] # Buffer for experience replay (last 3 iterations)
 
     total_epochs = 1000
     for epoch in range(start_epoch, total_epochs):
@@ -403,9 +390,9 @@ def train(on_move_callback=None):
         if not data:
             continue
             
-        # Update Buffer (Sliding Window of size 3)
+        # Update Buffer (Sliding Window)
         data_buffer.append(data)
-        if len(data_buffer) > 50:
+        if len(data_buffer) > BUFFER_SIZE:
             data_buffer.pop(0)
             
         # Combine data
@@ -433,7 +420,7 @@ def train(on_move_callback=None):
                 [nodes, adj, hand, mask], 
                 {'policy': policies, 'value': values}, 
                 epochs=5, 
-                batch_size=32, 
+                batch_size=64, 
                 verbose=1
             )
             
@@ -453,7 +440,7 @@ def train(on_move_callback=None):
         
         # 5. Save History
         with open(HISTORY_PATH, 'wb') as f:
-            pickle.dump([epoch + 1, loss_history, game_record], f)
+            pickle.dump([epoch + 1, loss_history, game_record, data_buffer], f)
             
         print(f"Model saved to {MODEL_PATH}")
         print(f"History saved to {HISTORY_PATH}")

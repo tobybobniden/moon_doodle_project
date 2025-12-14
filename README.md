@@ -96,17 +96,17 @@ class GreedyAI(AIPlayer):
         return best_move
 ```
 
-#### AlphaZeroAI (強化學習 AI)
-基於 AlphaGo Zero 架構的實作，包含以下組件：
-- **AlphaZeroNetwork**: 負責神經網路 (TensorFlow/Keras) 的預測與訓練。
-- **MCTS (Monte Carlo Tree Search)**: 負責搜尋最佳落子策略。
-- **MoonZeroAdapter**: 負責遊戲狀態與神經網路輸入之間的轉換。
+#### StudentOfGamesAI (強化學習 AI)
+基於 Student of Games (SOG) 架構的實作，包含以下組件：
+- **SOGNetwork**: 負責神經網路 (TensorFlow/Keras) 的預測與訓練 (Policy & Value)。
+- **SOGSearch (CFR)**: 負責搜尋最佳落子策略，使用 Growing-Tree CFR 與 Regret Matching+。
+- **SOGAdapter**: 負責遊戲狀態與神經網路輸入之間的轉換。
 
 ```python
-from src.ai_logic import AlphazeroAI
+from src.ai_logic import StudentOfGamesAI
 
 # 載入訓練好的模型
-ai = AlphazeroAI('AlphaZero', model_path='models/alphazero_model.h5', 
+ai = StudentOfGamesAI('SOG', model_path='models/sog_model.keras', 
                  input_dim=..., num_actions=...)
 ```
 
@@ -482,14 +482,14 @@ moon_doodle_project/
 ├── Moon_Game_Launcher.ipynb      # 專案啟動器 (Jupyter Notebook)
 ├── README.md                     # 統一文檔（本檔案）
 ├── models/                       # 存放訓練好的模型
-│   └── alphazero_model.h5
+│   └── sog_model.keras
 └── src/                          # 原始碼目錄
     ├── __init__.py
     ├── New_moon_game.py          # 遊戲主程式與 UI
     ├── ai_logic.py               # AI 邏輯 (AlphaZero, MCTS, Greedy, Random)
     ├── game_model.py             # 遊戲核心邏輯
     ├── game_view.py              # 遊戲視圖元件
-    ├── train_alphazero.py        # AlphaZero 訓練腳本
+    ├── train_sog.py              # Student of Games 訓練腳本
     └── train_with_ui.py          # 帶 UI 的訓練腳本
 ```
 
@@ -613,8 +613,8 @@ sys.exit(app.exec_())
 - ✅ 新增 Jupyter Notebook 啟動器
 
 ### 版本 1.4 - 程式碼品質與訓練紀錄
-- ✅ **降低循環複雜度**：重構核心檔案 (`train_alphazero.py`, `game_model.py`, `game_view.py`, `New_moon_game.py`)，將大型函數拆解為小型私有方法，提升可讀性與維護性。
-- ✅ **訓練歷程紀錄**：`train_alphazero.py` 新增 `training_history.pkl` 機制，自動儲存 Loss 曲線與對戰結果，並支援斷點續訓。
+- ✅ **降低循環複雜度**：重構核心檔案 (`train_sog.py`, `game_model.py`, `game_view.py`, `New_moon_game.py`)，將大型函數拆解為小型私有方法，提升可讀性與維護性。
+- ✅ **訓練歷程紀錄**：`train_sog.py` 新增 `training_history.pkl` 機制，自動儲存 Loss 曲線與對戰結果，並支援斷點續訓。
 - ✅ **數據分析工具**：更新 `Moon_Game_Launcher.ipynb`，新增訓練數據視覺化功能，可直接繪製 Loss 趨勢圖與勝率變化曲線。
 
 ### 版本 1.5 - GNN 架構升級
@@ -629,16 +629,49 @@ sys.exit(app.exec_())
 - ✅ **WSL2 GPU 支援**：針對 RTX 50 系列顯卡優化 TensorFlow 環境配置，解決 VRAM 溢出與 JIT 編譯問題。
 - ✅ **效能監控工具**：新增 GPU 基準測試與 VRAM 清理工具於 Launcher 中。
 
+### 版本 2.1 - 訓練穩定性與視覺化
+- ✅ **訓練穩定性 (Training Stability)**：Value Loss 改用 Huber Loss，解決極端值導致的梯度爆炸問題。
+- ✅ **模型格式標準化 (Standardization)**：全面遷移至 Keras 3 `.keras` 格式，提升跨平台相容性。
+- ✅ **超參數優化 (Hyperparameter Tuning)**：Batch Size 優化至 64，平衡訓練速度與梯度估計準確度。
+- ✅ **視覺化增強 (Visualization)**：Launcher 新增 Loss 與分數的 Min/Max 區間顯示，更直觀呈現訓練變異數。
+
 ---
 
-## AlphaZero AI 升級 (v2.0)
+## AI 架構演進：Student of Games (SOG)
 
-### 核心改進：為什麼 AI 變聰明了？
+### 為什麼轉向 Student of Games？
 
-在 v2.0 版本中，我們針對 AI 經常出現的「贏了就好，不在乎分數」以及「不知道自己領先還是落後」的問題進行了重大升級。
+本專案最初基於 AlphaZero (MCTS + CNN) 架構，但在 v2.0 後全面遷移至 **Student of Games (SOG)**。這是 DeepMind 提出的一種更通用的演算法，結合了樹搜尋與博弈論。
+
+對於月相棋盤遊戲，SOG 架構帶來了關鍵優勢：
+1.  **更強大的搜尋機制**：使用 **Growing-Tree CFR (GT-CFR)** 替代傳統的 MCTS。CFR (Counterfactual Regret Minimization) 通過最小化「後悔值」來逼近納什均衡 (Nash Equilibrium)，在策略對抗中比單純的價值最大化更具魯棒性。
+2.  **動態博弈樹擴展**：SOG 不像傳統 CFR 需要遍歷整棵樹，而是像 MCTS 一樣動態增長樹結構，結合了兩者的優點。
+
+### SOG 模型架構詳解
+
+我們的 SOG 實作包含三個主要組件，針對圖形棋盤進行了深度優化：
+
+#### 1. 圖神經網路 (GNN Backbone)
+由於棋盤是任意拓撲結構，傳統 CNN 難以處理。我們採用 GNN 來提取空間特徵：
+- **節點特徵 (Node Features)**：包含月相值、擁有者(One-hot)、是否為空、合法動作遮罩等。
+- **全域特徵 (Global Features)**：廣播至每個節點，包含手牌資訊、**雙方當前分數**、剩餘步數。
+- **訊息傳遞 (Message Passing)**：節點之間通過連接線交換資訊，讓 AI 理解「連接」與「阻斷」的戰略意義。
+
+#### 2. 雙頭輸出 (Dual Heads)
+- **Policy Head (策略頭)**：輸出每個合法動作的機率分佈。
+- **Value Head (價值頭)**：預測當前局面的期望回報。
+    - **改進**：在 v2.1 中，我們將 Loss Function 從 MSE 改為 **Huber Loss**，這能有效減少訓練初期的梯度爆炸，並對異常值更具魯棒性。
+
+#### 3. 搜尋與決策 (Search & Act)
+- **Regret Matching+**：在搜尋節點中，根據累積的後悔值來選擇動作。
+- **Value Bootstrap**：葉節點的價值由神經網路估計，並反向傳播更新整棵樹的後悔值。
+
+### 關鍵改進：分數感知與混合獎勵
+
+在舊版 AI 中，我們發現模型經常出現「贏了就好，不在乎分數」以及「不知道自己領先還是落後」的問題。
 
 #### 1. 輸入特徵擴增 (27 -> 29 維)
-舊版 AI 只看得到棋盤狀態，不知道當前比分。新版 AI 的輸入向量增加了兩個關鍵維度：
+新版 AI 的輸入向量增加了兩個關鍵維度：
 - **我方當前分數 (Normalized)**
 - **對手當前分數 (Normalized)**
 
@@ -647,7 +680,7 @@ sys.exit(app.exec_())
 - **領先時**：採取穩健策略，破壞對手的連線機會。
 
 #### 2. 混合獎勵函數 (Hybrid Reward)
-舊版 AlphaZero 只有 `+1` (贏) 和 `-1` (輸)。這導致 AI 認為「100:0 贏」和「51:50 贏」是一樣的，因此它經常放棄高分機會，只求穩贏。
+舊版只有 `+1` (贏) 和 `-1` (輸)。這導致 AI 認為「100:0 贏」和「51:50 贏」是一樣的。
 
 新版獎勵函數：
 $$ Reward = 0.8 \times FinalOutcome + 0.2 \times ScoreDiff $$

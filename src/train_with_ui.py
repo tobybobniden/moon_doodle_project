@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLa
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
 from src.New_moon_game import MainWindow
-from src.train_alphazero import train
+from src.train_sog import train
 from src.game_model import MoonPhaseGame
 
 class TrainingThread(QThread):
@@ -25,7 +25,7 @@ class TrainingThread(QThread):
 class TrainingWindow(MainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AlphaZero Training Visualization")
+        self.setWindowTitle("Student of Games Training Visualization")
         
         # Add a label to indicate training status
         self.lbl_status = QLabel("Training in progress...")
